@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ---- Virtual Environments ----
+venv/
+venv310/
+.env/
+*.env
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+# ---- Cache / logs ----
+.cache/
+*.log
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- HuggingFace cache ----
+~/.cache/huggingface/
+
+# ---- SBERT embeddings ----
+data/book_embs.npy
