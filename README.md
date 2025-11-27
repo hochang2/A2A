@@ -141,7 +141,6 @@ a2a/
 │   │   ├── llm_decider.py                  # LLM 감정·전략·장르 파서
 │   │   ├── llm_reranker.py                 # LLM 재랭킹 + 설명 생성
 │   │   ├── graph_book.py                   # LangGraph 파이프라인 정의
-│   │   ├── debug_sanity.py                 # Sanity test
 │   │   └── run_chat_llm_demo.py            # 대화형 데모 실행
 │   │
 │   └── common/
@@ -197,21 +196,7 @@ python -m src.book.run_chat_llm_demo
 > 심심한데 설레고 싶다
 ```
 
----
 
-## 4) Sanity Test
-```bash
-python -m src.book.debug_sanity
-```
-
-출력:
-
-- LLM 파싱(JSON)
-- SBERT/CF 후보 목록
-- Top-5
-- 자연어 설명문
-
----
 
 # 📈 향후 개선 로드맵
 
@@ -235,3 +220,4 @@ python -m src.book.debug_sanity
 
 ---
 ```
+
