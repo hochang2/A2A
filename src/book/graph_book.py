@@ -1,25 +1,22 @@
 # src/book/graph_book.py
 
 """
-LangGraph 기반 Book 추천 파이프라인.
+LangGraph 기반 Book 추천 파이프라인 (단순화 버전).
 
 구조 개요
 ---------
 1) LLM Decider (llm_decider.decide_strategy_with_llm)
-   - user_input을 받아서 현재 감정, 원하는 감정, 장르, 전략(by_title / by_mood 등)을 JSON으로 파싱.
+   - user_input을 받아서 현재 감정, 원하는 감정, 장르, 전략 등을 JSON으로 파싱.
    - 결과는 state["decision"]에 저장.
 
-2) Candidate Generation (BookRecommender + CFRecommender)
-   - 콘텐츠 기반 후보:
-       BookRecommender.recommend_from_llm_decision(llm_decision, top_k)
-   - CF 기반 후보:
-       CFRecommender.recommend_for_user(user_id, top_k, filter_read_items=True)
-   - 두 후보를 merge_candidates()로 합쳐서
-       - content_score, cf_score, hybrid_score를 계산.
+2) Candidate Generation (콘텐츠 기반 SBERT만 사용)
+   - BookRecommender.recommend_from_llm_decision(llm_decision, top_k, user_input, exclude_book_ids)
+   - user_profile의 seen_books를 이용해 "이미 읽은 책"은 제외.
    - 결과를 state["candidates"]에 저장.
+   - CFRecommender는 초기 추천(run_chat_llm_demo.get_initial_recommendations)에서만 사용.
 
 3) LLM Reranker (llm_reranker.rerank_with_llm)
-   - 입력: user_input, llm_decision, candidates
+   - 입력: user_input, llm_decision, candidates (+ user_top_genres; 나중에 필요 시 Phase 2에서 정리 가능)
    - 출력: {
        "reranked": [ ... 책 dict ... ],
        "natural_output": "사용자에게 보여줄 자연어 추천 문장"
@@ -35,18 +32,19 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
+import os
 
 from langgraph.graph import StateGraph, END
 
 from src.common.state_types import BaseRecState
 from src.config import (
-    HYBRID_ALPHA_CONTENT,
     MAX_CANDIDATES_FOR_LLM,
 )
 from .recommender import BookRecommender
 from .cf_recommender import CFRecommender
 from . import llm_decider
 from . import llm_reranker
+from src.book.user_profile import get_user_profile
 
 logger = logging.getLogger(__name__)
 
@@ -103,130 +101,28 @@ def get_recommenders() -> tuple[BookRecommender, CFRecommender]:
         logger.info("[Graph] Initializing CFRecommender (item-based CF)")
         # content_rec에서 book_id universe를 가져와 CF에 넘겨줌
         valid_book_ids = set(_content_rec.df["book_id"].unique())
-
+        base_dir = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        my_ratings_path = os.path.join(
+            base_dir, "data", "goodbooks-10k", "my_ratings.csv"
+        )
         _cf_rec = CFRecommender(
-            min_ratings_per_user=5,
-            min_ratings_per_item=5,
+            min_ratings_per_user=1,
+            min_ratings_per_item=1,
             max_items_for_similarity=None,
-            use_als=False,  # ⚠ 현재는 ALS 비활성화, item-based CF만 사용
             valid_book_ids=valid_book_ids,
         )
         _cf_rec.load_data()
         _cf_rec.build_interaction_matrix()
-        # item-based similarity 계산
+        # item-based similarity 계산 (초기 추천 등에서 사용 가능)
         _cf_rec.compute_item_similarity()
 
     return _content_rec, _cf_rec
 
 
 # ============================================================
-# 3. 후보 merge 유틸
-# ============================================================
-
-
-def _normalize_scores_by_rank(
-    items: List[Dict[str, Any]],
-    score_key: str,
-) -> None:
-    """
-    주어진 score_key 기준으로 items를 정렬한 뒤,
-    '랭크 기반' 0~1 점수로 다시 매긴다.
-
-    예:
-        N개 아이템이 있을 때,
-        1등 → 1.0
-        2등 → (N-2)/(N-1)
-        ...
-        꼴등 → 0.0
-    """
-    if not items:
-        return
-
-    # score 기준으로 내림차순 정렬
-    items.sort(key=lambda x: x.get(score_key, 0.0), reverse=True)
-    n = len(items)
-    if n == 1:
-        items[0][score_key] = 1.0
-        return
-
-    for rank, item in enumerate(items):
-        # rank: 0이 1등
-        item[score_key] = float(n - 1 - rank) / float(n - 1)
-
-
-def merge_candidates(
-    content_candidates: List[Dict[str, Any]] | None,
-    cf_candidates: List[Dict[str, Any]] | None,
-    alpha: float,
-) -> List[Dict[str, Any]]:
-    """
-    콘텐츠 기반 후보 + CF 후보를 book_id 기준으로 merge하여
-    content_score / cf_score / hybrid_score를 계산한다.
-
-    - alpha: content와 cf의 비율 (0.0 ~ 1.0)
-        hybrid_score = alpha * content_score + (1 - alpha) * cf_score
-    - content_score / cf_score는 모두 0~1로 정규화된 값이라고 가정하되,
-      필요시 여기서 rank 기반으로 한 번 더 normalize.
-
-    반환 값: book_id 기준으로 unique한 후보 리스트 (hybrid_score 기준 내림차순)
-    """
-    content_candidates = content_candidates or []
-    cf_candidates = cf_candidates or []
-
-    # 1) book_id → 후보 dict 병합
-    merged: Dict[int, Dict[str, Any]] = {}
-
-    # 콘텐츠 후보 먼저
-    for c in content_candidates:
-        bid = int(c["book_id"])
-        merged[bid] = {
-            "book_id": bid,
-            "title": c.get("title"),
-            "authors": c.get("authors"),
-            "content_score": float(c.get("score", c.get("content_score", 0.0))),
-            "cf_score": 0.0,
-        }
-
-    # CF 후보 overlay
-    for c in cf_candidates:
-        bid = int(c["book_id"])
-        if bid not in merged:
-            merged[bid] = {
-                "book_id": bid,
-                "title": c.get("title"),
-                "authors": c.get("authors"),
-                "content_score": 0.0,
-                "cf_score": float(c.get("score", c.get("cf_score", 0.0))),
-            }
-        else:
-            merged[bid]["cf_score"] = float(
-                c.get("score", c.get("cf_score", merged[bid]["cf_score"]))
-            )
-            # title/authors가 비어 있으면 CF 쪽 정보로 채우기
-            if not merged[bid].get("title"):
-                merged[bid]["title"] = c.get("title")
-            if not merged[bid].get("authors"):
-                merged[bid]["authors"] = c.get("authors")
-
-    merged_list = list(merged.values())
-
-    # 2) rank 기반 정규화 (content_score / cf_score 각각)
-    _normalize_scores_by_rank(merged_list, "content_score")
-    _normalize_scores_by_rank(merged_list, "cf_score")
-
-    # 3) hybrid_score 계산
-    for item in merged_list:
-        c_score = float(item.get("content_score", 0.0))
-        cf_score = float(item.get("cf_score", 0.0))
-        item["hybrid_score"] = alpha * c_score + (1.0 - alpha) * cf_score
-
-    # 4) hybrid_score 기준 정렬
-    merged_list.sort(key=lambda x: x.get("hybrid_score", 0.0), reverse=True)
-    return merged_list
-
-
-# ============================================================
-# 4. LangGraph 노드 정의
+# 3. LangGraph 노드 정의
 # ============================================================
 
 
@@ -255,7 +151,6 @@ def parse_intent_node(state: BookState) -> BookState:
             "extra_constraints": [],
         }
 
-    # 디버그용 요약
     d = state["decision"]
     logger.info(
         "[LLM 분석 결과 요약]\n"
@@ -278,84 +173,49 @@ def generate_candidates_node(state: BookState) -> BookState:
     """
     2단계: 전통 추천 시스템으로 후보 책 리스트를 생성.
 
-    - 콘텐츠 기반: BookRecommender.recommend_from_llm_decision
-    - CF 기반: CFRecommender.recommend_for_user
-    - 둘 다 있으면 merge_candidates()로 hybrid_score 계산
-    - 하나만 있으면 그쪽 후보만 사용
+    🔹 현재 버전 목표:
+      - 대화형 추천에서는 **콘텐츠 기반(SBERT)** 만 사용
+      - CF는 초기 추천(user_id만 있을 때)에서만 사용
     """
     user_id = state.get("user_id")
     decision = state.get("decision", {})
     user_input = state.get("user_input", "")
 
-    content_rec, cf_rec = get_recommenders()
+    # BookRecommender만 사용
+    content_rec, _ = get_recommenders()
 
-    # 1) 콘텐츠 기반 후보
-    content_candidates: List[Dict[str, Any]] = []
+    # (당장은 단순화를 위해 seen_books / user_top_genres 안 씀)
+    # 필요해지면 나중에 다시 붙이면 됨
     try:
         content_candidates = content_rec.recommend_from_llm_decision(
             llm_decision=decision,
-            user_input=user_input,  # 🔹 추가
             top_k=MAX_CANDIDATES_FOR_LLM,
+            user_input=user_input,
         )
-
     except Exception as e:
         logger.exception("[Graph] content recommend_from_llm_decision error: %s", e)
-        content_candidates = []
+        state["candidates"] = []
+        return state
 
-    # 2) CF 기반 후보
-    cf_candidates: List[Dict[str, Any]] = []
-    try:
-        if user_id is not None:
-            cf_candidates = cf_rec.recommend_for_user(
-                user_id=user_id,
-                top_k=MAX_CANDIDATES_FOR_LLM,
-                # 온라인 추천에서는 이미 본 책은 웬만하면 제외
-                filter_read_items=True,
-            )
-    except Exception as e:
-        logger.exception("[Graph] CF recommend_for_user error: %s", e)
-        cf_candidates = []
-
-    # 3) merge 로직
-    if content_candidates and cf_candidates:
-        candidates = merge_candidates(
-            content_candidates=content_candidates,
-            cf_candidates=cf_candidates,
-            alpha=HYBRID_ALPHA_CONTENT,
+    # SBERT 점수를 그대로 hybrid_score에 복사
+    candidates: List[Dict[str, Any]] = []
+    for c in content_candidates:
+        score = float(c.get("score", c.get("content_score", 0.0)))
+        candidates.append(
+            {
+                "book_id": int(c["book_id"]),
+                "title": c.get("title"),
+                "authors": c.get("authors"),
+                "content_score": score,
+                "hybrid_score": score,  # 지금은 content-only
+            }
         )
-    elif cf_candidates:
-        # CF만 있을 때도 후속 단계에서 hybrid_score에 맞춰 사용 가능하도록 필드 맞추기
-        candidates = []
-        for c in cf_candidates:
-            candidates.append(
-                {
-                    "book_id": int(c["book_id"]),
-                    "title": c.get("title"),
-                    "authors": c.get("authors"),
-                    "content_score": 0.0,
-                    "cf_score": float(c.get("score", c.get("cf_score", 0.0))),
-                    "hybrid_score": float(c.get("score", c.get("cf_score", 0.0))),
-                }
-            )
-    elif content_candidates:
-        candidates = []
-        for c in content_candidates:
-            candidates.append(
-                {
-                    "book_id": int(c["book_id"]),
-                    "title": c.get("title"),
-                    "authors": c.get("authors"),
-                    "content_score": float(c.get("score", c.get("content_score", 0.0))),
-                    "cf_score": 0.0,
-                    "hybrid_score": float(c.get("score", c.get("content_score", 0.0))),
-                }
-            )
-    else:
-        logger.warning("[Graph] No candidates from either content or CF.")
-        candidates = []
 
+    candidates.sort(key=lambda x: x.get("hybrid_score", 0.0), reverse=True)
     state["candidates"] = candidates
     return state
+
+
 
 
 def rerank_with_llm_node(state: BookState) -> BookState:
@@ -366,6 +226,7 @@ def rerank_with_llm_node(state: BookState) -> BookState:
     user_input = state.get("user_input", "")
     decision = state.get("decision", {})
     candidates = state.get("candidates", [])
+    user_id = state.get("user_id")
 
     logger.debug(
         "[Graph] rerank_with_llm_node - #candidates=%d",
@@ -373,18 +234,28 @@ def rerank_with_llm_node(state: BookState) -> BookState:
     )
 
     if not candidates:
-        # 후보가 하나도 없으면 LLM 호출 대신 기본 메시지
         state["reranked"] = []
         state[
             "natural_output"
         ] = "지금은 추천할 수 있는 책 후보가 없습니다. 나중에 다시 시도해 주세요."
         return state
 
+    # user_profile에서 top_genres 다시 한 번 가져와서 reranker에 넘김
+    user_top_genres: List[str] = []
+    if user_id is not None:
+        try:
+            profile = get_user_profile(int(user_id))
+            user_top_genres = profile.get("top_genres", []) or []
+        except Exception as e:
+            logger.exception("[Graph] get_user_profile error in rerank node: %s", e)
+            user_top_genres = []
+
     try:
         result = llm_reranker.rerank_with_llm(
             user_input=user_input,
             llm_decision=decision,
             candidates=candidates,
+            user_top_genres=user_top_genres,
         )
         reranked = result.get("reranked", [])
         natural_output = result.get("natural_output", "").strip()
@@ -393,8 +264,9 @@ def rerank_with_llm_node(state: BookState) -> BookState:
         if natural_output:
             state["natural_output"] = natural_output
         else:
-            # natural_output이 비어 있으면 간단한 기본 설명 생성
-            titles = [c.get("title") for c in state["reranked"][:3] if c.get("title")]
+            titles = [
+                c.get("title") for c in state["reranked"][:3] if c.get("title")
+            ]
             if titles:
                 state[
                     "natural_output"
@@ -406,22 +278,36 @@ def rerank_with_llm_node(state: BookState) -> BookState:
 
     except Exception as e:
         logger.exception("[Graph] LLM reranker error: %s", e)
-        # 실패 시: 후보는 그대로 두고, 간단한 fallback 문장 사용
         state["reranked"] = candidates
         state[
             "natural_output"
         ] = "시스템 내부 오류로 인해 단순 추천 순서로 책을 보여드립니다. 양해 부탁드립니다."
 
+    # 🔹 여기서 공통으로 인사말 prefix 붙이기
+    try:
+        uid = state.get("user_id")
+        first_title = None
+        if state.get("reranked"):
+            first_title = state["reranked"][0].get("title")
+
+        if uid is not None and first_title:
+            prefix = f"안녕하세요 {uid}님, 오늘은 『{first_title}』를 포함해 몇 권의 책을 추천드려요.\n\n"
+        elif uid is not None:
+            prefix = f"안녕하세요 {uid}님, 지금의 기분과 취향에 맞는 책들을 추천드려요.\n\n"
+        else:
+            prefix = ""
+
+        state["natural_output"] = prefix + state.get("natural_output", "")
+    except Exception as e:
+        logger.exception("[Graph] greeting prefix error: %s", e)
+
     return state
 
 
 # ============================================================
-# 5. 그래프 구성 + 헬퍼
+# 4. 그래프 구성 + 헬퍼
 # ============================================================
 
-
-from langgraph.graph import StateGraph, END
-# 필요하면 타입용으로만: from langgraph.graph import CompiledGraph  (버전에 따라 다를 수 있음)
 
 def build_book_graph():
     """
@@ -440,7 +326,6 @@ def build_book_graph():
     graph.add_edge("generate_candidates", "rerank_with_llm")
     graph.add_edge("rerank_with_llm", END)
 
-    # 🔥 핵심: 여기서 compile() 호출
     app = graph.compile()
     return app
 

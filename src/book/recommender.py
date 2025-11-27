@@ -1,237 +1,328 @@
 """
-BookRecommender (SBERT 버전)
+BookRecommender (SBERT 버전, 최종 정리본)
 
-GoodBooks-10k 책 메타데이터를 기반으로
-**Sentence-BERT 임베딩**을 사용한 콘텐츠 기반 추천을 제공하는 모듈.
+GoodBooks-10k 책 메타데이터 기반으로
+Sentence-BERT 임베딩을 이용한 콘텐츠 기반 추천을 수행하는 엔진.
 
-역할
-----
-1) books.csv 로딩 및 전처리
-2) title + authors + genres + description 을 합친 full_text를 SBERT로 임베딩
-3) 자연어 취향(preference_text) 혹은 LLM decider 결과(llm_decision)를 받아
-   임베딩 cosine similarity 기반으로 후보 리스트 반환
+📌 포함된 기능
+------------------------------------------
+1) books.csv 로딩 & full_text 생성
+2) SBERT 임베딩 계산 + 캐싱
+3) LLM Decider 결과 기반 추천
+4) exclude_book_ids 처리
+5) 장르 필터링 후 재정렬
+6) 한국어/아랍어 등 특정 언어 필터링 제거
 
-외부에서 주로 사용하는 메서드
------------------------------
+외부에서 사용하는 핵심 메서드
+------------------------------------------
 - recommend_with_preferences(preference_text, mood_keywords, genres, top_k)
-- recommend_from_llm_decision(llm_decision, top_k)
+- recommend_from_llm_decision(llm_decision, top_k, user_input, exclude_book_ids)
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+import json  # ⬅️ 새로 추가
+from typing import Any, Dict, List, Optional, Set
+import logging
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from src.config import BOOK_TFIDF_MAX_FEATURES
 
-from src.config import BOOK_TFIDF_MAX_FEATURES  # max_features는 지금 안 쓰지만, 호환용으로 유지
 
-# SBERT 모델 이름 (필요하면 config로 뺄 수 있음)
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-# 언어 필터: 아랍어(히브리어 포함) 제목은 제외
+
+# =========================================================
+# 언어 필터: 아랍어/히브리어 제거
+# =========================================================
 def is_non_korean_preferred(book) -> bool:
     title = str(book.get("title", ""))
-
     for ch in title:
-        # 아랍어 / 페르시아 / 우르두 등
-        if '\u0600' <= ch <= '\u06FF':
+        if '\u0600' <= ch <= '\u06FF':  # Arabic block
             return False
-        # 아랍어 확장 영역 (여유로 추가해도 됨)
-        if '\u0750' <= ch <= '\u077F':
+        if '\u0750' <= ch <= '\u077F':  # Arabic supplement
             return False
     return True
 
+
+# =========================================================
+# SBERT 콘텐츠 기반 추천 엔진
+# =========================================================
 class BookRecommender:
     """
-    GoodBooks-10k 기반 **임베딩 기반 콘텐츠 추천 엔진**.
-
-    필수 컬럼
-    ---------
-    - book_id
-    - title
-    - authors 또는 author
-    - genres
-    - description
-
-    내부적으로 full_text = title + authors + genres + description
-    에 대해 SBERT 임베딩을 구성하여 cosine similarity 기반으로 추천을 수행한다.
+    SBERT 임베딩 기반 콘텐츠 추천 엔진.
     """
 
     def __init__(
         self,
         csv_path: Optional[str] = None,
-        max_features: Optional[int] = None,  # 예전 TF-IDF 시대의 파라미터(호환용, 지금은 사용 안 함)
         embedding_model_name: str = DEFAULT_EMBEDDING_MODEL,
     ) -> None:
-        """
-        Parameters
-        ----------
-        csv_path : str, optional
-            책 메타데이터 CSV 경로.
-            None이면 프로젝트 루트 기준 data/goodbooks-10k/books.csv 를 기본값으로 사용.
-        max_features : int, optional
-            (이전 TF-IDF용 파라미터. 지금은 사용하지 않지만 시그니처 호환을 위해 남김.)
-        embedding_model_name : str
-            SentenceTransformer 모델 이름.
-        """
+
+        # 기본 books.csv 경로 설정
         if csv_path is None:
-            # 프로젝트 루트 기준 data/goodbooks-10k/books.csv
             base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             csv_path = os.path.join(base_dir, "data", "goodbooks-10k", "books.csv")
 
         self.csv_path = csv_path
         self.embedding_model_name = embedding_model_name
 
-        # 책 메타데이터
+        # 1) 데이터 로드 + 전처리
         self.df: pd.DataFrame = self._load_and_prepare_df(csv_path)
+        
+        # 2) TF-IDF 벡터라이저 + 매트릭스
+        self.tfidf_vectorizer: TfidfVectorizer
+        self.tfidf_matrix: sparse.spmatrix
+        self.tfidf_vectorizer, self.tfidf_matrix = self._build_tfidf_matrix()
 
-        # SBERT 모델 로드
+        # 3) SBERT 모델 로드
         self.model: SentenceTransformer = SentenceTransformer(self.embedding_model_name)
 
-        # 책 full_text 임베딩 (n_books, dim)
+        # 4) 책 임베딩 생성/로드
         self.embeddings: np.ndarray = self._build_book_embeddings()
 
     # --------------------------------------------------------
-    # 1-1. 데이터 로딩 & 전처리
+    # 1. 데이터 로딩 + 전처리
     # --------------------------------------------------------
-
     def _load_and_prepare_df(self, csv_path: str) -> pd.DataFrame:
-        """
-        CSV를 로드하고 필수 컬럼을 정리한 뒤 full_text 컬럼을 생성한다.
-        """
+        # 0) books.csv 로드
         df = pd.read_csv(csv_path)
 
-        # book_id 존재 여부 체크
-        if "book_id" not in df.columns:
-            raise ValueError("books.csv 에 'book_id' 컬럼이 필요합니다.")
+        # 프로젝트 루트 기준 base_dir
+        base_dir = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
 
-        # title
+        # 1) 필수 컬럼 보정 ----------------------------------------
         if "title" not in df.columns:
-            raise ValueError("books.csv 에 'title' 컬럼이 필요합니다.")
-        df["title"] = df["title"].fillna("").astype(str)
+            df["title"] = ""
+        else:
+            df["title"] = df["title"].fillna("").astype(str)
 
-        # authors / author 처리
-        if "authors" in df.columns:
+        if "authors" not in df.columns:
+            df["authors"] = ""
+        else:
             df["authors"] = df["authors"].fillna("").astype(str)
-        elif "author" in df.columns:
-            df["authors"] = df["author"].fillna("").astype(str)
-        else:
-            raise ValueError("books.csv 에 'authors' 또는 'author' 컬럼이 필요합니다.")
 
-        # genres
-        if "genres" in df.columns:
-            df["genres"] = df["genres"].fillna("").astype(str)
-        else:
+        if "genres" not in df.columns:
             df["genres"] = ""
-
-        # description
-        if "description" in df.columns:
-            df["description"] = df["description"].fillna("").astype(str)
         else:
-            df["description"] = ""
+            df["genres"] = df["genres"].fillna("").astype(str)
 
-        # full_text 생성: 추천에 사용할 통합 텍스트
-        df["full_text"] = (
-            df["title"].astype(str)
-            + " "
-            + df["authors"].astype(str)
-            + " "
-            + df["genres"].astype(str)
-            + " "
-            + df["description"].astype(str)
+        if "genres_en" not in df.columns:
+            df["genres_en"] = ""
+        else:
+            df["genres_en"] = df["genres_en"].fillna("").astype(str)
+
+        if "description" not in df.columns:
+            df["description"] = (
+                df["title"].astype(str)
+                + " "
+                + df["authors"].astype(str)
+                + " "
+                + df["genres"].astype(str)
+            ).str.strip()
+        else:
+            df["description"] = df["description"].fillna("").astype(str)
+
+        # 2) book_genres.json 로드해서 genres 보강 ------------------
+        try:
+            genres_json_path = os.path.join(
+                base_dir, "data", "goodbooks-10k", "book_genres.json"
+            )
+            with open(genres_json_path, "r", encoding="utf-8") as f:
+                genres_raw = json.load(f)  # {"1": ["fantasy", ...], ...}
+
+            # key를 int(book_id)로 매핑
+            genre_map: Dict[int, List[str]] = {
+                int(k): (v or []) for k, v in genres_raw.items()
+            }
+
+            def _genres_from_json(bid: Any) -> str:
+                try:
+                    lst = genre_map.get(int(bid), [])
+                except Exception:
+                    lst = []
+                if not lst:
+                    return ""
+                return " ".join(str(x) for x in lst)
+
+            df["genres_from_json"] = df["book_id"].map(_genres_from_json).fillna("")
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "[BookRec] book_genres.json 로드 실패: %s", e
+            )
+            df["genres_from_json"] = ""
+
+        # 3) book_tags.csv + tags.csv 로 태그 텍스트 만들기 ---------
+        try:
+            tags_path = os.path.join(base_dir, "data", "goodbooks-10k", "tags.csv")
+            book_tags_path = os.path.join(
+                base_dir, "data", "goodbooks-10k", "book_tags.csv"
+            )
+
+            tags_df = pd.read_csv(tags_path)            # tag_id, tag_name
+            book_tags_df = pd.read_csv(book_tags_path)  # goodreads_book_id, tag_id, count
+
+            # tag_id -> tag_name
+            tag_name_map: Dict[int, str] = dict(
+                zip(tags_df["tag_id"].astype(int), tags_df["tag_name"].astype(str))
+            )
+
+            book_tags_df["tag_name"] = book_tags_df["tag_id"].map(tag_name_map)
+            book_tags_df = book_tags_df[book_tags_df["tag_name"].notna()]
+
+            def _is_meaningful_tag(name: str) -> bool:
+                name = str(name).strip()
+                if not name:
+                    return False
+                # 전부 숫자/기호면 버리기
+                if all((not ch.isalpha()) for ch in name):
+                    return False
+                return True
+
+            book_tags_df = book_tags_df[
+                book_tags_df["tag_name"].map(_is_meaningful_tag)
+            ]
+
+            # 각 책별 count 기준 상위 N개 태그만 사용
+            TOP_N_TAGS = 5
+
+            # goodreads_book_id가 books.csv의 book_id와 같다고 가정
+            book_tags_df["goodreads_book_id"] = book_tags_df[
+                "goodreads_book_id"
+            ].astype(int)
+
+            book_tags_df = book_tags_df.sort_values(
+                ["goodreads_book_id", "count"], ascending=[True, False]
+            )
+
+            top_tags_df = book_tags_df.groupby("goodreads_book_id").head(TOP_N_TAGS)
+
+            tags_agg = (
+                top_tags_df.groupby("goodreads_book_id")["tag_name"]
+                .apply(lambda xs: " ".join(str(t) for t in xs))
+            )
+
+            # df["book_id"] 기준 매핑 (book_id == goodreads_book_id 가정)
+            df["tags_text"] = df["book_id"].astype(int).map(tags_agg).fillna("")
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "[BookRec] tags/book_tags 로드 실패: %s", e
+            )
+            df["tags_text"] = ""
+
+        # 4) genres_text + full_text 구성 ---------------------------
+        df["genres_text"] = (
+            df["genres"].fillna("") + " " + df["genres_from_json"].fillna("")
         ).str.strip()
-        self.book_genre_text: dict[int, str] = {}
+
+        df["full_text"] = (
+            df["title"].fillna("")
+            + " "
+            + df["authors"].fillna("")
+            + " "
+            + df["genres_text"].fillna("")
+            + " "
+            + df["tags_text"].fillna("")
+            + " "
+            + df["description"].fillna("")
+        ).str.strip()
+
+        # 5) book_genre_text (장르/태그 기반 boost용) ---------------
+        self.book_genre_text: Dict[int, str] = {}
         for _, row in df.iterrows():
             bid = int(row["book_id"])
-            text = (
-                str(row["genres"]) + " " +
-                str(row["title"]) + " " +
-                str(row["authors"])
+            meta_text = (
+                str(row.get("genres_text", ""))
+                + " "
+                + str(row.get("tags_text", ""))
+                + " "
+                + str(row["title"])
+                + " "
+                + str(row["authors"])
             ).lower()
-            self.book_genre_text[bid] = text
+            self.book_genre_text[bid] = meta_text
 
+        # 6) 언어 필터 적용 -----------------------------------------
+        df = df[df.apply(is_non_korean_preferred, axis=1)].reset_index(drop=True)
+
+        # ✅ 반드시 df를 반환해야 self.df가 None이 되지 않습니다.
         return df
 
+
+    def _build_tfidf_matrix(self) -> tuple[TfidfVectorizer, sparse.spmatrix]:
+        """
+        full_text 기준 TF-IDF 행렬 생성.
+        - 캐시 없이 매 실행 시 다시 학습 (속도 크게 문제될 정도는 아님)
+        """
+        vectorizer = TfidfVectorizer(
+            max_features=BOOK_TFIDF_MAX_FEATURES,
+            ngram_range=(1, 2),
+            stop_words="english",
+        )
+        texts = self.df["full_text"].tolist()
+        tfidf_matrix = vectorizer.fit_transform(texts)
+        return vectorizer, tfidf_matrix
+
+
     # --------------------------------------------------------
-    # 1-2. SBERT 임베딩 생성, 저장
+    # 2. SBERT 임베딩 로드/생성
     # --------------------------------------------------------
     def _get_embedding_cache_path(self) -> str:
-        """
-        SBERT 책 임베딩을 캐싱할 .npy 파일 경로를 생성한다.
-        모델 이름에 따라 파일명을 다르게 해서, 모델을 바꾸면 자동으로 새 파일을 쓰게 함.
-        """
-        # 프로젝트 루트 기준
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         cache_dir = os.path.join(base_dir, "data", "goodbooks-10k")
         os.makedirs(cache_dir, exist_ok=True)
 
-        # 모델 이름에서 / 같은 문자 제거/치환
-        model_tag = self.embedding_model_name.replace("/", "__")
-        filename = f"book_embs_{model_tag}.npy"
-
+        tag = self.embedding_model_name.replace("/", "__")
+        filename = f"book_embs_{tag}.npy"
         return os.path.join(cache_dir, filename)
 
     def _build_book_embeddings(self) -> np.ndarray:
-        """
-        full_text 에 대해 SBERT 임베딩을 생성한다.
-        - 먼저 캐시(.npy)가 있으면 로드 시도
-        - 없거나, 행 개수가 안 맞으면 새로 계산 후 저장
-        """
         cache_path = self._get_embedding_cache_path()
 
-        # 1) 캐시가 있으면 먼저 로드 시도
+        # 캐시 로드
         if os.path.exists(cache_path):
             try:
                 embs = np.load(cache_path)
-                # 책 개수(df 길이)와 임베딩 행 개수가 같으면 그대로 사용
                 if embs.shape[0] == len(self.df):
                     return embs.astype(np.float32)
-            except Exception:
-                # 로드 실패 시에는 그냥 새로 계산
-                pass
+            except:
+                pass  # 실패하면 새로 계산
 
-        # 2) 캐시가 없거나, 사이즈가 안 맞으면 새로 계산
+        # 새로 생성
         texts = self.df["full_text"].tolist()
         embeddings = self.model.encode(texts, batch_size=64, show_progress_bar=True)
         embeddings = np.asarray(embeddings, dtype=np.float32)
 
-        # 3) 계산 결과 캐싱
         np.save(cache_path, embeddings)
-
         return embeddings
 
-
     # --------------------------------------------------------
-    # 1-3. 내부 유틸
+    # 3. 내부 유틸
     # --------------------------------------------------------
-
     def _build_query_text(
         self,
         preference_text: Optional[str],
-        mood_keywords: Optional[List[str]] = None,
-        genres: Optional[List[str]] = None,
+        mood_keywords: Optional[List[str]],
+        genres: Optional[List[str]],
     ) -> str:
-        """
-        자연어 취향(preference_text) + mood_keywords + genres 를 합쳐
-        하나의 쿼리 텍스트로 만든다.
-        """
-        tokens: List[str] = []
-
+        tokens = []
         if preference_text:
-            tokens.append(str(preference_text))
+            tokens.append(preference_text)
 
         if mood_keywords:
-            tokens.extend([str(m) for m in mood_keywords if m])
+            tokens.extend(mood_keywords)
 
         if genres:
-            tokens.extend([str(g) for g in genres if g])
+            tokens.extend(genres)
 
-        query = " ".join(tokens).strip()
-        return query
+        return " ".join(tokens).strip()
 
     def _score_by_embedding(
         self,
@@ -239,33 +330,49 @@ class BookRecommender:
         top_k: int = 50,
     ) -> List[Dict[str, Any]]:
         """
-        SBERT 임베딩 기반 cosine similarity 로 상위 top_k 책을 반환한다.
+        SBERT + TF-IDF 하이브리드 콘텐츠 스코어링.
 
-        반환 형식
-        --------
-        [
-            {
-                "book_id": int,
-                "title": str,
-                "authors": str,
-                "score": float (0~1 정규화)
-            },
-            ...
-        ]
+        - SBERT: self.embeddings (full_text 임베딩)
+        - TF-IDF: self.tfidf_vectorizer, self.tfidf_matrix (full_text 기반)
+        두 점수를 0.5 : 0.5 로 단순 가중 평균합니다.
         """
         if not query_text:
             return []
 
-        # 쿼리 임베딩
-        query_vec = self.model.encode([query_text])  # (1, dim)
-        # 코사인 유사도 계산
-        sims = cosine_similarity(query_vec, self.embeddings)[0]  # (n_books,)
+        # -----------------------------
+        # 1) SBERT similarity
+        # -----------------------------
+        query_emb = self.model.encode([query_text])
+        sims_sbert = cosine_similarity(query_emb, self.embeddings)[0]  # (num_books,)
 
-        # 상위 top_k 인덱스
-        top_indices = np.argsort(sims)[::-1][:top_k]
+        # -----------------------------
+        # 2) TF-IDF similarity (있으면)
+        # -----------------------------
+        sims_tfidf = None
+        if getattr(self, "tfidf_vectorizer", None) is not None and getattr(self, "tfidf_matrix", None) is not None:
+            try:
+                q_tfidf = self.tfidf_vectorizer.transform([query_text])
+                sims_tfidf = cosine_similarity(q_tfidf, self.tfidf_matrix)[0]  # (num_books,)
+            except Exception:
+                # 혹시라도 에러 나면 SBERT만 사용
+                sims_tfidf = None
 
-        results: List[Dict[str, Any]] = []
-        for idx in top_indices:
+        # -----------------------------
+        # 3) 두 스코어 합치기
+        # -----------------------------
+        if sims_tfidf is not None:
+            # 간단히 0.5 : 0.5 평균
+            sims = 0.5 * sims_sbert + 0.5 * sims_tfidf
+        else:
+            sims = sims_sbert
+
+        # -----------------------------
+        # 4) 상위 top_k 뽑기 + 0~1 정규화
+        # -----------------------------
+        top_idx = np.argsort(sims)[::-1][:top_k]
+
+        results = []
+        for idx in top_idx:
             row = self.df.iloc[idx]
             results.append(
                 {
@@ -278,17 +385,22 @@ class BookRecommender:
 
         # 0~1 정규화
         if results:
-            max_score = max(r["score"] for r in results)
-            min_score = min(r["score"] for r in results)
-            if max_score > min_score:
+            scores = [r["score"] for r in results]
+            mx, mn = max(scores), min(scores)
+            if mx > mn:
                 for r in results:
-                    r["score"] = (r["score"] - min_score) / (max_score - min_score)
+                    r["score"] = (r["score"] - mn) / (mx - mn)
             else:
-                # 모든 점수가 동일한 경우 → 전부 1.0 처리
                 for r in results:
                     r["score"] = 1.0
 
         return results
+
+
+
+    # --------------------------------------------------------
+    # 4. 장르 필터링(LLM 장르 우선 적용)
+    # --------------------------------------------------------
     def _filter_and_reorder_by_genre(
         self,
         results: List[Dict[str, Any]],
@@ -296,127 +408,109 @@ class BookRecommender:
         top_k: int,
         hard_filter_top_n: int = 3,
     ) -> List[Dict[str, Any]]:
-        """
-        SBERT로 뽑은 results에 대해:
-        - required_genres_en에 해당하는 장르가 메타데이터에 들어있는 책들을 우선 선택
-        - 최소 hard_filter_top_n 권 이상이면, 그 중에서 top_k까지 사용
-        - 부족하면: 장르 매칭된 책 + 나머지 결과를 섞어서 top_k까지 채움
-        """
+
         if not results or not required_genres_en:
             return results[:top_k]
 
-        # 모두 소문자로
-        required_genres_en = [g.lower() for g in required_genres_en if g]
+        required_genres_en = [g.lower() for g in required_genres_en]
 
-        genre_matched: List[Dict[str, Any]] = []
-        genre_unmatched: List[Dict[str, Any]] = []
+        matched = []
+        unmatched = []
 
         for r in results:
             bid = int(r["book_id"])
-            meta_text = self.book_genre_text.get(bid, "")
-            meta_text_lower = meta_text.lower()
-
-            # 하나라도 포함되면 genre 매칭으로 봄
-            if any(g in meta_text_lower for g in required_genres_en):
-                genre_matched.append(r)
+            meta = self.book_genre_text.get(bid, "")
+            if any(g in meta for g in required_genres_en):
+                matched.append(r)
             else:
-                genre_unmatched.append(r)
+                unmatched.append(r)
 
-        # 1) 장르 매칭된 책이 충분히 많으면, 그 안에서 top_k
-        if len(genre_matched) >= hard_filter_top_n:
-            return genre_matched[:top_k]
+        # 충분하면 matched만
+        if len(matched) >= hard_filter_top_n:
+            return matched[:top_k]
 
-        # 2) 부족하면: 매칭된 책들을 우선 넣고, 나머지는 기존 순서대로 채우기
-        merged: List[Dict[str, Any]] = []
-        merged.extend(genre_matched)
-        for r in genre_unmatched:
-            if len(merged) >= top_k:
+        # 부족하면 unmatched 섞기
+        out = matched.copy()
+        for r in unmatched:
+            if len(out) >= top_k:
                 break
-            merged.append(r)
+            out.append(r)
 
-        return merged[:top_k]
+        return out[:top_k]
 
     # ========================================================
-    # 2. 외부 인터페이스 (추천 API)
+    # 5. 외부 API (핵심)
     # ========================================================
-
     def recommend_with_preferences(
         self,
         preference_text: Optional[str],
-        mood_keywords: Optional[List[str]] = None,
-        genres: Optional[List[str]] = None,
+        mood_keywords: Optional[List[str]],
+        genres: Optional[List[str]],
         top_k: int = 50,
     ) -> List[Dict[str, Any]]:
-        """
-        자연어로 표현된 취향/상황(preference_text)와 mood_keywords, genres를 받아
-        SBERT 임베딩 기반 콘텐츠 추천을 수행한다.
 
-        예시
-        ----
-        preference_text = "잔잔한 감성의 성장소설"
-        mood_keywords = ["calm", "healing"]
-        genres = ["young adult", "contemporary"]
-        """
-        query_text = self._build_query_text(
-            preference_text=preference_text,
-            mood_keywords=mood_keywords,
-            genres=genres,
-        )
-
-        return self._score_by_embedding(query_text=query_text, top_k=top_k)
+        query = self._build_query_text(preference_text, mood_keywords, genres)
+        return self._score_by_embedding(query, top_k)
 
     def recommend_from_llm_decision(
         self,
         llm_decision: Dict[str, Any],
         top_k: int = 50,
         user_input: Optional[str] = None,
+        exclude_book_ids: Optional[Set[int]] = None,
     ) -> List[Dict[str, Any]]:
+
         if llm_decision is None:
             llm_decision = {}
 
-        # 1) 쿼리 텍스트 재료 모으기 (기존 그대로)
-        preference_tokens: List[str] = []
+        exclude_book_ids = exclude_book_ids or set()
 
-        mentioned_titles = llm_decision.get("mentioned_titles") or []
-        preference_tokens.extend([str(t) for t in mentioned_titles if t])
+        # ------------------------------
+        # ① LLM 토큰 조합하여 query 만들기
+        # ------------------------------
+        preference_tokens = []
 
-        extra_constraints = llm_decision.get("extra_constraints") or []
-        preference_tokens.extend([str(c) for c in extra_constraints if c])
+        preference_tokens.extend(llm_decision.get("mentioned_titles", []) or [])
+        preference_tokens.extend(llm_decision.get("extra_constraints", []) or [])
+        preference_tokens.extend(llm_decision.get("current_emotion", []) or [])
+        preference_tokens.extend(llm_decision.get("desired_feeling", []) or [])
+        preference_tokens.extend(llm_decision.get("content_mood", []) or [])
 
-        current_emotion = llm_decision.get("current_emotion") or []
-        desired_feeling = llm_decision.get("desired_feeling") or []
-        content_mood = llm_decision.get("content_mood") or []
-        preference_tokens.extend([str(e) for e in current_emotion if e])
-        preference_tokens.extend([str(e) for e in desired_feeling if e])
-        preference_tokens.extend([str(m) for m in content_mood if m])
-
+        preference_text = " ".join(preference_tokens).strip()
         mood_keywords = llm_decision.get("mood_keywords") or []
 
         genres_ko = llm_decision.get("genres") or []
         genres_en = llm_decision.get("genres_en") or []
-        genres = []
-        genres.extend([str(g) for g in genres_ko if g])
-        genres.extend([str(g) for g in genres_en if g])
+        genres = genres_ko + genres_en
 
-        preference_text = " ".join(preference_tokens).strip()
-
-        # 2) SBERT(또는 TF-IDF)로 1차 후보 뽑기
-        #    - top_k 보다 넉넉히 뽑아서 장르 필터를 적용할 여유를 둠
-        base_top_k = max(top_k * 3, 50)
+        # ------------------------------
+        # ② SBERT로 넉넉히 후보 뽑기
+        # ------------------------------
+        base_k = max(top_k * 3, 50)
         raw_results = self.recommend_with_preferences(
             preference_text=preference_text,
             mood_keywords=mood_keywords,
             genres=genres,
-            top_k=base_top_k,
+            top_k=base_k,
         )
 
-        # 3) genres_en 이 있으면 장르 필터/보정 적용
-        required_genres_en = [str(g) for g in genres_en if g]
-        final_results = self._filter_and_reorder_by_genre(
+        # ------------------------------
+        # ③ exclude_book_ids 적용
+        # ------------------------------
+        if exclude_book_ids:
+            raw_results = [
+                r for r in raw_results if int(r["book_id"]) not in exclude_book_ids
+            ]
+
+        # ------------------------------
+        # ④ 장르 필터링 (LLM 장르 우선)
+        # ------------------------------
+        required_genres_en = [g.lower() for g in genres_en if g]
+        final = self._filter_and_reorder_by_genre(
             results=raw_results,
             required_genres_en=required_genres_en,
             top_k=top_k,
-            hard_filter_top_n=3,  # 최소 이 정도는 같은 장르로 맞추자
+            hard_filter_top_n=3,
         )
 
-        return final_results
+        return final
