@@ -1,154 +1,237 @@
-📚 A2A Book Recommendation System
+```markdown
+# 📚 A2A Book Recommendation System
 
-LLM + 콘텐츠 기반( SBERT ) + 협업필터링 기반 하이브리드 추천 시스템
+**LLM + SBERT 기반 콘텐츠 추천 + 협업필터링(ALS/Implicit) + LLM 재랭킹**  
+→ 감정 기반 하이브리드 책 추천 시스템
 
-이 프로젝트는 사용자의 자연어 입력(기분·상황·취향) 을 분석하여
-가장 적합한 책을 추천하는 하이브리드 추천 시스템입니다.
+사용자의 **자연어 입력(기분·상황·취향)** 을 분석하여  
+가장 적합한 책을 추천하는 고급 추천 엔진입니다.
 
-사용자 입력 → LLM 파싱 → 콘텐츠 기반 후보 생성 (SBERT)
-                           → CF 후보 집계
-                           → LLM Re-rank → 자연어 설명 생성
+파이프라인:
 
-✨ Features
-1) LLM 기반 전략/취향 파싱 (LLM Decider)
+> **사용자 입력 → LLM 파싱 → SBERT 콘텐츠 기반 후보 → CF 후보 → LLM Re-rank → 자연어 설명 생성**
 
-사용자 입력 문장에서 다음을 추출:
+---
 
-mood / 감정 (sad, excited…)
+## ✨ Features
 
-desired feeling
+---
 
-genres
+## 🔍 1. LLM 기반 전략·취향 파싱 (LLM Decider)
 
-content mood
+사용자 입력 문장에서 자동으로 다음 정보를 추출합니다:
 
-전략(by_mood, by_genre, hybrid)
+- `mood / 감정` (예: sad, lonely, happy)
+- `desired_feeling` (예: comforted, motivated)
+- `genres` / `genres_en`
+- `content_mood`
+- `strategy` (by_mood / by_genre / hybrid)
 
-JSON 형식으로만 응답하도록 강제 → 안정적인 파서 설계
+LLM이 **항상 JSON으로만 답하도록 강제**하여  
+파싱 오류를 최소화했습니다.
 
-2) SBERT 기반 콘텐츠 기반 추천 (TF-IDF → 업그레이드 완료)
+---
 
-전체 책(GoodBooks-10k)을 SBERT 임베딩
+## 🧠 2. SBERT 기반 콘텐츠 기반 추천 (Content-based)
 
-내용/장르/저자 기반 의미적 유사도 계산
+> **TF-IDF → SBERT 임베딩 기반**으로 업그레이드 완료
 
-초기 계산만 40초 → 이후 캐싱(npy)하면 즉시 불러오기
+- 책의 **설명 / 제목 / 저자 / 장르**를 기반으로 SBERT 임베딩 생성
+- 전체 GoodBooks-10k 코퍼스를 **벡터화 후 NPY 캐싱**
+- 코사인 유사도로 의미 기반 추천 수행
+- 최초 임베딩 생성에는 약 40초  
+  → 이후에는 즉시 로딩
 
-3) ALS/Implicit 기반 협업 필터링(CF)
+---
 
-사용자의 과거 평점 기반 추천
+## 👥 3. ALS / Implicit 기반 협업필터링 (CF)
 
-현재는 cold-start → fallback 구조로 작동
+- 사용자의 과거 평점 기반 추천(ALS)
+- cold-start 시 popularity fallback
+- 실제 환경에서는  
+  - user 로그 누적  
+  - implicit feedback 활용  
+  - 개인화 추천 강화  
+  가능하도록 설계됨
 
-향후 user 로그 학습 시 쉽게 확장 가능
+---
 
-4) LLM Reranker + 자연어 추천 설명
+## 🏆 4. LLM Reranker + 자연어 설명 생성
 
-후보 top-N에 대해 LLM이:
+SBERT/CF 후보 Top-N에 대해:
 
-사용자 mood에 맞게 재랭킹
+### 1) LLM Reranking
+- LLM이 `mood / desired_feeling / genres` 맥락에 맞춰  
+  기존 hybrid score를 크게 훼손하지 않는 범위에서 재정렬
 
-자연어 해설문 생성 (고급 UX)
+### 2) 자연어 추천 설명 생성
+- “왜 이 책을 추천했는지”를 한국어로 부드럽고 자연스럽게 설명
+- 실제 UX에 큰 효과
 
-5) LangGraph 기반 파이프라인 설계
+---
 
-Node 구성:
+## 🧭 5. LangGraph 기반 파이프라인 구성
 
-llm_decider_node
+추천 시스템 전체를 LangGraph의 노드로 구성:
 
-generate_candidates_node (SBERT + CF)
+- `llm_decider_node`
+- `generate_candidates_node`
+- `rerank_node`
+- `natural_output_node`
 
-rerank_node
+장점:
 
-natural_output_node
+- 구조 분리 + 디버깅 편리
+- 모듈 추가/확장에 최적화
+- Multi-domain 확장 용이
 
-그래프로 pipeline 실행 → 유지보수/확장 용이
+---
 
-6) Sanity-check 스크립트 (debug_sanity.py)
+## 🧪 6. Sanity-check 스크립트 (`debug_sanity.py`)
 
-여러 사용자 입력을 자동으로 테스트하여:
+샘플 입력 여러 개를 한 번에 테스트 → 결과 종합 출력:
 
-LLM 파싱 결과
+- LLM 파싱(JSON)
+- SBERT/CF hybrid 후보
+- Top-5 최종 결과
+- 자연어 설명
 
-후보 리스트 top-5
+```bash
+python -m src.book.debug_sanity
+```
 
-자연어 설명문
+---
 
-을 한눈에 검증할 수 있음.
+## 🌍 7. 비한국어(아랍어 등) 제목 자동 필터링
 
-7) 비한국어(아랍어 등) 제목 필터링
+SBERT 후보·CF 후보 모두에 대해  
+아랍어/히브리어 범위를 포함한 책을 자동 필터링합니다.
 
-다음 범위(\u0600–\u06FF)의 문자가 포함된 책 제목은 자동 제외.
-
-def is_non_korean_preferred(book):
-    for ch in book["title"]:
-        if '\u0600' <= ch <= '\u06FF':
+```python
+def is_non_korean_preferred(book: dict) -> bool:
+    title = book["title"]
+    for ch in title:
+        if "\u0600" <= ch <= "\u06FF":  # Arabic/Hebrew block
             return False
     return True
+```
 
+→ 한국어/영어 독서 사용자에게 노이즈 제거 효과
 
-콘텐츠 기반 + CF 전체 결과에 적용됨.
+---
 
-🗂 프로젝트 구조
+# 🗂 프로젝트 구조
+
+```plaintext
 a2a/
 ├── data/
-│   ├── books.csv
-│   ├── book_embs.npy      # SBERT 캐싱
+│   ├── books.csv                           # 책 메타데이터 (GoodBooks-10k)
+│   ├── book_embs.npy                       # SBERT 임베딩 캐시
+│   ├── ratings.csv
+│   ├── to_read.csv                         # 암묵적 피드백 (rating = 1.0)
+│   ├── tags.csv
+│   ├── book_tags.csv
+│   ├── book_genres.json
+│   └── my_ratings.csv                      # 현재 CF에서는 미사용
 │
 ├── src/
 │   ├── book/
-│   │   ├── recommender.py        # SBERT 기반 content rec
-│   │   ├── cf_recommender.py     # Collaborative Filtering
-│   │   ├── llm_decider.py        # LLM 취향 파서
-│   │   ├── llm_reranker.py       # LLM 재랭커
-│   │   ├── graph_book.py         # LangGraph 파이프라인
-│   │   ├── debug_sanity.py       # 품질 검증 스크립트
-│   │   ├── run_chat_llm_demo.py  # 실사용 demo
+│   │   ├── recommender.py                  # SBERT Content-based 추천
+│   │   ├── cf_recommender.py               # ALS/Implicit 기반 CF
+│   │   ├── llm_decider.py                  # LLM 감정·전략·장르 파서
+│   │   ├── llm_reranker.py                 # LLM 재랭킹 + 설명 생성
+│   │   ├── graph_book.py                   # LangGraph 파이프라인 정의
+│   │   ├── debug_sanity.py                 # Sanity test
+│   │   └── run_chat_llm_demo.py            # 대화형 데모 실행
 │   │
-│   ├── common/
-│   │   ├── state_types.py
-│   │
-├── README.md
+│   └── common/
+│       └── state_types.py                  # 공통 상태 타입
+│
 ├── requirements.txt
-└── .env
+├── README.md
+└── .env                                    # API keys (Git 업로드 금지)
+```
 
-🚀 실행 방법
-1) 환경 구성
+---
+
+# 🚀 실행 방법
+
+## 1) 패키지 설치
+```bash
 pip install -r requirements.txt
-
+```
 
 필수 라이브러리:
 
-sentence-transformers
+- sentence-transformers
+- langgraph
+- openai
+- pandas / numpy
+- implicit (CF 사용시)
 
-langgraph
+---
 
-openai
-
-pandas, numpy
-
-implicit (옵션)
-
-2) SBERT 임베딩 생성 + 캐싱
+## 2) SBERT 임베딩 생성 + 캐싱
+```bash
 python -m src.book.build_embeddings
+```
 
+생성 파일:
+```
+data/book_embs.npy
+```
 
-생성된 임베딩은 자동으로 data/book_embs.npy에 저장됩니다.
+→ 이후에는 로딩만 수행 (빠름)
 
-3) demo 실행
+---
+
+## 3) 데모 실행
+```bash
 python -m src.book.run_chat_llm_demo
+```
 
-4) sanity 테스트
+입력 예시:
+
+```
+지금 읽고 싶은 책/기분/취향을 자유롭게 적어보세요:
+> 심심한데 설레고 싶다
+```
+
+---
+
+## 4) Sanity Test
+```bash
 python -m src.book.debug_sanity
+```
 
-📈 향후 개선 로드맵
+출력:
 
-BM25 기반 장르·설명 sparse vector 추가(Hybrid)
+- LLM 파싱(JSON)
+- SBERT/CF 후보 목록
+- Top-5
+- 자연어 설명문
 
-User 로그를 활용한 협업필터링 fully 활성화
+---
 
-LLM output grounding (hallucination 감소)
+# 📈 향후 개선 로드맵
 
-영화/음악/음식 도메인으로 확장 (A2A Multi-domain)
+### 🔹 모델링 강화
+- BM25 sparse + SBERT dense Hybrid 개선  
+- CF fully 활성화(ALS + implicit feedback 응용)  
+- 사용자 장기 취향 기반 personalization 강화
 
-서버형 FastAPI backend로 전환 → 프론트 연결
+### 🔹 LLM 개선
+- grounding 강화 → hallucination 감소  
+- 결과 정합성 검증 layer 추가
+
+### 🔹 도메인 확장
+- 영화 / 음악 / 음식 추천까지 확장  
+- A2A Multi-Domain Recommender로 확장
+
+### 🔹 서비스화/MLOps
+- FastAPI 기반 Backend  
+- Web UI 연동  
+- 임베딩 버전 관리 / 캐시 자동화
+
+---
+```
