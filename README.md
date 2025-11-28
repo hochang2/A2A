@@ -1,155 +1,186 @@
-```markdown
 # 📚 A2A Book Recommendation System
 
-**LLM + SBERT 기반 콘텐츠 추천 + 협업필터링(ALS/Implicit) + LLM 재랭킹**  
-→ 감정 기반 하이브리드 책 추천 시스템
+**LLM + SBERT 콘텐츠 기반 추천 + 협업필터링(ALS/implicit) + LLM 재랭킹**  
+→ 감정·상황·취향까지 반영하는 **하이브리드 책 추천 시스템**
 
 사용자의 **자연어 입력(기분·상황·취향)** 을 분석하여  
 가장 적합한 책을 추천하는 고급 추천 엔진입니다.
 
-파이프라인:
+파이프라인 개요:
 
-> **사용자 입력 → LLM 파싱 → SBERT 콘텐츠 기반 후보 → CF 후보 → LLM Re-rank → 자연어 설명 생성**
-
----
-
-## ✨ Features
+> **사용자 입력 → LLM 파싱 → SBERT+TF-IDF 콘텐츠 후보 → CF(ALS) 후보 → Hybrid 결합 → LLM Re-rank → 자연어 설명 생성**
 
 ---
 
-## 🔍 1. LLM 기반 전략·취향 파싱 (LLM Decider)
+# 🏗 전체 아키텍처 & 코드 흐름 (my_ratings 제거 버전)
 
-사용자 입력 문장에서 자동으로 다음 정보를 추출합니다:
-
-- `mood / 감정` (예: sad, lonely, happy)
-- `desired_feeling` (예: comforted, motivated)
-- `genres` / `genres_en`
-- `content_mood`
-- `strategy` (by_mood / by_genre / hybrid)
-
-LLM이 **항상 JSON으로만 답하도록 강제**하여  
-파싱 오류를 최소화했습니다.
+A2A 추천 흐름을 **코드 기준**으로 정리하면 (✔ *my_ratings 관련 로직 제외*):
 
 ---
 
-## 🧠 2. SBERT 기반 콘텐츠 기반 추천 (Content-based)
+## 1. `run_chat_llm_demo.py` — 엔트리 포인트
 
-> **TF-IDF → SBERT 임베딩 기반**으로 업그레이드 완료
+### ✔ STEP 0: 초기 추천 (선택적)  
+- 사용자에게 user_id 입력
+- `get_initial_recommendations(user_id)` 호출  
+  → ALS 기반 CF 추천  
+  → CF 불가능하면 popularity fallback  
+- 사용자가 고른 책을 **my_ratings.csv에 저장하지 않음(제거됨)**  
+  → 현재는 단순히 추천만 보여주는 구조
 
-- 책의 **설명 / 제목 / 저자 / 장르**를 기반으로 SBERT 임베딩 생성
-- 전체 GoodBooks-10k 코퍼스를 **벡터화 후 NPY 캐싱**
-- 코사인 유사도로 의미 기반 추천 수행
-- 최초 임베딩 생성에는 약 40초  
-  → 이후에는 즉시 로딩
+> **나중에 "초기 추천"을 없애고 싶다면**  
+> → `run_chat_llm_demo.py`의 "초기 추천" 섹션을 통째로 삭제하면 됨  
+> 파이프라인은 그대로 정상 동작합니다.
 
----
+### ✔ STEP 1: 감정 기반 자연어 추천 루프
 
-## 👥 3. ALS / Implicit 기반 협업필터링 (CF)
-
-- 사용자의 과거 평점 기반 추천(ALS)
-- cold-start 시 popularity fallback
-- 실제 환경에서는  
-  - user 로그 누적  
-  - implicit feedback 활용  
-  - 개인화 추천 강화  
-  가능하도록 설계됨
-
----
-
-## 🏆 4. LLM Reranker + 자연어 설명 생성
-
-SBERT/CF 후보 Top-N에 대해:
-
-### 1) LLM Reranking
-- LLM이 `mood / desired_feeling / genres` 맥락에 맞춰  
-  기존 hybrid score를 크게 훼손하지 않는 범위에서 재정렬
-
-### 2) 자연어 추천 설명 생성
-- “왜 이 책을 추천했는지”를 한국어로 부드럽고 자연스럽게 설명
-- 실제 UX에 큰 효과
+- 사용자 입력 받기
+- `run_book_recommendation(user_input, user_id)` 호출
+- 결과 구성:
+  - LLM 파싱(JSON)
+  - SBERT/CF hybrid Top-N
+  - LLM 재랭킹 결과
+  - 자연어 추천 설명 출력
 
 ---
 
-## 🧭 5. LangGraph 기반 파이프라인 구성
+## 2. `graph_book.py` — LangGraph 파이프라인
 
-추천 시스템 전체를 LangGraph의 노드로 구성:
+`run_book_recommendation()` 내부에서 LangGraph 구성:
 
-- `llm_decider_node`
-- `generate_candidates_node`
-- `rerank_node`
-- `natural_output_node`
+### ✔ BookState
+- `user_input`
+- `user_id`
+- `decision` (LLM 파싱 JSON)
+- `candidates` (hybrid 후보)
+- `reranked` (LLM 재랭킹 결과)
+- `natural_output` (설명문)
 
-장점:
+➡ my_ratings 관련 필드는 없음.
 
-- 구조 분리 + 디버깅 편리
-- 모듈 추가/확장에 최적화
-- Multi-domain 확장 용이
+### ✔ 그래프 노드 구성
+
+1. **`llm_decider_node`**  
+   → 감정·장르·전략 JSON 생성
+
+2. **`generate_candidates_node`**  
+   - SBERT/TF-IDF 콘텐츠 기반 추천 생성  
+   - ALS CF 추천 생성  
+   - hybrid score로 결합  
+   - `state["candidates"]` 채움
+
+3. **`rerank_node`**  
+   - LLM 기반 재랭킹  
+   - 감정·장르 맥락 반영  
+   - `state["reranked"]` 채움
+
+4. **`natural_output_node`**  
+   - LLM이 추천 이유를 자연스럽게 생성  
+   - `state["natural_output"]` 저장
 
 ---
 
-## 🧪 6. Sanity-check 스크립트 (`debug_sanity.py`)
+## 3. `recommender.py` — SBERT + TF-IDF 콘텐츠 기반 추천
 
-샘플 입력 여러 개를 한 번에 테스트 → 결과 종합 출력:
+- `books.csv`, `book_genres.json`, `tags.csv`, `book_tags.csv` 사용
+- `full_text` 구성: 제목 + 작가 + 장르 + 태그 + 설명  
+- TF-IDF 학습 후 캐시 저장  
+- SBERT 임베딩도 캐시로 저장  
+- 이후 실행에서는 로드만 수행 → 매우 빠름
 
-- LLM 파싱(JSON)
-- SBERT/CF hybrid 후보
-- Top-5 최종 결과
-- 자연어 설명
-
-```bash
-python -m src.book.debug_sanity
-```
-
----
-
-## 🌍 7. 비한국어(아랍어 등) 제목 자동 필터링
-
-SBERT 후보·CF 후보 모두에 대해  
-아랍어/히브리어 범위를 포함한 책을 자동 필터링합니다.
+### Hybrid scoring
 
 ```python
-def is_non_korean_preferred(book: dict) -> bool:
-    title = book["title"]
-    for ch in title:
-        if "\u0600" <= ch <= "\u06FF":  # Arabic/Hebrew block
-            return False
-    return True
-```
+score = 0.5 * sbert_similarity + 0.5 * tfidf_similarity
 
-→ 한국어/영어 독서 사용자에게 노이즈 제거 효과
+# 📚 A2A Book Recommendation System — ALS 적용 버전 (my_ratings 제거)
 
 ---
 
-# 🗂 프로젝트 구조
+## 4. `cf_recommender.py` — ALS 기반 협업필터링
 
-```plaintext
+### ✔ 사용 데이터
+- `ratings.csv`
+- `to_read.csv` (implicit → rating=1.0으로 자동 변환)
+
+### ✔ 핵심 기능
+- ALS 학습 후  
+  → **user_factors / item_factors** 캐시로 저장  
+- 매 실행 시 캐시 자동 로드 (학습 불필요)
+- `recommend_for_user(user_id, top_k)` 제공  
+- cold-start → **popularity fallback**
+
+---
+
+### ✔ my_ratings 관련 기능 완전 제거
+- 사용자 선택 책을 기록하지 않음  
+- “읽은 책 제외하기” 기능 비활성화  
+- 완전한 **비상호작용형 협업필터링 구조**
+
+---
+
+## 5. `llm_decider.py` / `llm_reranker.py`
+
+- 자연어 입력 → 감정·전략·장르 JSON 파싱
+- SBERT/CF Hybrid 후보 리스트를 LLM이 재랭킹
+- 사용자의 현재 감정/목적에 맞춘 **설명문 자동 생성**
+- JSON 출력 강제 + grounding 기법으로 안정성 강화
+
+---
+
+## 6. `debug_sanity.py` — 전체 파이프라인 일괄 테스트
+
+- 여러 자연어 입력을 자동 테스트
+- 수행 흐름:
+  1) **LLM 파싱(JSON)**  
+  2) **SBERT/CF Hybrid 후보 생성**  
+  3) **LLM 재랭킹**  
+  4) **최종 설명문 출력**  
+
+- my_ratings은 사용하지 않음
+
+---
+
+# 🌍 비한국어 제목 자동 필터링
+
+- SBERT·CF 후보 모두에 대해  
+  **아랍어·히브리어 유니코드 범위** 감지하여 제외
+- 한국어/영어 사용자에게 노이즈 감소
+
+---
+
+# 🗂 프로젝트 구조 (my_ratings 제거 버전)
+
 a2a/
 ├── data/
-│   ├── books.csv                           # 책 메타데이터 (GoodBooks-10k)
-│   ├── book_embs.npy                       # SBERT 임베딩 캐시
+│   ├── books.csv
 │   ├── ratings.csv
-│   ├── to_read.csv                         # 암묵적 피드백 (rating = 1.0)
+│   ├── to_read.csv
 │   ├── tags.csv
 │   ├── book_tags.csv
 │   ├── book_genres.json
-│   └── my_ratings.csv                      # 현재 CF에서는 미사용
+│   ├── book_embs_*.npy
+│   ├── tfidf_vectorizer_fulltext_*.joblib
+│   ├── tfidf_matrix_fulltext_*.npz
+│   └── als_model_f*_r*_it*_a*.npz
 │
 ├── src/
 │   ├── book/
-│   │   ├── recommender.py                  # SBERT Content-based 추천
-│   │   ├── cf_recommender.py               # ALS/Implicit 기반 CF
-│   │   ├── llm_decider.py                  # LLM 감정·전략·장르 파서
-│   │   ├── llm_reranker.py                 # LLM 재랭킹 + 설명 생성
-│   │   ├── graph_book.py                   # LangGraph 파이프라인 정의
-│   │   └── run_chat_llm_demo.py            # 대화형 데모 실행
+│   │   ├── recommender.py
+│   │   ├── cf_recommender.py
+│   │   ├── llm_decider.py
+│   │   ├── llm_reranker.py
+│   │   ├── graph_book.py
+│   │   ├── run_chat_llm_demo.py
+│   │   └── debug_sanity.py
 │   │
 │   └── common/
-│       └── state_types.py                  # 공통 상태 타입
+│       └── state_types.py
 │
 ├── requirements.txt
-├── README.md
-└── .env                                    # API keys (Git 업로드 금지)
-```
+└── .env
+
+### ✔ CF는 ALS + implicit feedback 기반으로만 작동  
 
 ---
 
@@ -158,66 +189,12 @@ a2a/
 ## 1) 패키지 설치
 ```bash
 pip install -r requirements.txt
-```
 
-필수 라이브러리:
-
-- sentence-transformers
-- langgraph
-- openai
-- pandas / numpy
-- implicit (CF 사용시)
-
----
-
-## 2) SBERT 임베딩 생성 + 캐싱
+## 2) SBERT 임베딩 생성
 ```bash
 python -m src.book.build_embeddings
-```
 
-생성 파일:
-```
-data/book_embs.npy
-```
-
-→ 이후에는 로딩만 수행 (빠름)
-
----
-
-## 3) 데모 실행
+## 2) 데모 실행
 ```bash
 python -m src.book.run_chat_llm_demo
-```
-
-입력 예시:
-
-```
-지금 읽고 싶은 책/기분/취향을 자유롭게 적어보세요:
-> 심심한데 설레고 싶다
-```
-
-
-
-# 📈 향후 개선 로드맵
-
-### 🔹 모델링 강화
-- BM25 sparse + SBERT dense Hybrid 개선  
-- CF fully 활성화(ALS + implicit feedback 응용)  
-- 사용자 장기 취향 기반 personalization 강화
-
-### 🔹 LLM 개선
-- grounding 강화 → hallucination 감소  
-- 결과 정합성 검증 layer 추가
-
-### 🔹 도메인 확장
-- 영화 / 음악 / 음식 추천까지 확장  
-- A2A Multi-Domain Recommender로 확장
-
-### 🔹 서비스화/MLOps
-- FastAPI 기반 Backend  
-- Web UI 연동  
-- 임베딩 버전 관리 / 캐시 자동화
-
----
-```
 
