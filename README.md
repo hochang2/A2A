@@ -187,14 +187,12 @@ a2a/
 # 🚀 실행 방법
 
 ## 1) 패키지 설치
-```bash
 pip install -r requirements.txt
 
 ## 2) SBERT 임베딩 생성
-```bash
 python -m src.book.build_embeddings
 
 ## 2) 데모 실행
-```bash
 python -m src.book.run_chat_llm_demo
+
 
