@@ -24,6 +24,9 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from implicit.als import AlternatingLeastSquares
+from implicit.cpu.als import AlternatingLeastSquares
+
 
 np.random.seed(42)
 logger = logging.getLogger(__name__)
@@ -114,8 +117,12 @@ class CFRecommender:
         # 상호작용 행렬 (users x items)
         self.interaction_matrix: Optional[sparse.csr_matrix] = None
 
-        # item-based CF similarity 행렬
-        self.item_similarity: Optional[sparse.csr_matrix] = None
+        # ALS 모델 (implicit 라이브러리)
+        self.als_model: Optional[AlternatingLeastSquares] = None
+
+        # ALS 캐시 파일 경로를 만들 때 쓸 기본 데이터 디렉토리
+        self._data_dir = os.path.dirname(self.ratings_csv_path)
+
 
     # --------------------------------------------------------
     # 1-1. 데이터 로딩 (ratings + to_read 통합)
@@ -245,48 +252,151 @@ class CFRecommender:
         )
 
     # --------------------------------------------------------
-    # 1-3. item_similarity 계산 (item-based CF)
+    # 1-3. ALS 캐시 경로 유틸
     # --------------------------------------------------------
-
-    def compute_item_similarity(self) -> None:
+    def _get_als_cache_path(
+        self,
+        factors: int,
+        regularization: float,
+        iterations: int,
+        alpha: float,
+    ) -> str:
         """
-        item-based CF를 위한 item-item similarity 행렬을 계산한다.
+        ALS 학습 결과(user_factors, item_factors)를 저장/로드할 캐시 파일 경로를 만든다.
+        하이퍼파라미터에 따라 파일 이름이 달라지도록 구성.
+        """
+        # 하이퍼파라미터를 간단한 정수 형태로 인코딩
+        reg_tag = int(regularization * 1000)
+        alpha_tag = int(alpha)
 
-        아이디어:
-        - A = interaction_matrix (users x items)
-        - item_co_counts = A.T @ A  (items x items)  → 공출현 정도
-        - 대각 성분을 이용해 cosine 유사도 형태로 정규화:
-          sim[i,j] = co[i,j] / sqrt(co[i,i] * co[j,j])
-        - 결과를 sparse matrix로 self.item_similarity에 저장
+        filename = f"als_model_f{factors}_r{reg_tag}_it{iterations}_a{alpha_tag}.npz"
+        return os.path.join(self._data_dir, filename)
+
+    # --------------------------------------------------------
+    # 1-4. ALS 학습 및 캐시 로드
+    # --------------------------------------------------------
+    def fit_als(
+        self,
+        factors: int = 64,
+        regularization: float = 0.01,
+        iterations: int = 15,
+        alpha: float = 40.0,
+        force_retrain: bool = False,
+    ) -> None:
+        """
+        implicit ALS 모델을 학습하거나, 기존 학습 결과를 캐시에서 로드한다.
+
+        - self.interaction_matrix: (num_users, num_items) CSR
+        - implicit ALS: (num_users, num_items) user-item matrix를 입력으로 받는다고 생각하면 됨
+          → "행(row)이 user" 라고만 맞춰주면 돼.
         """
         if self.interaction_matrix is None:
-            raise RuntimeError("먼저 build_interaction_matrix()를 호출해야 합니다.")
+            raise RuntimeError("먼저 load_data()와 build_interaction_matrix()를 호출해야 합니다.")
 
-        # items x users
-        item_user_matrix = self.interaction_matrix.T.tocsr()
+        num_users, num_items = self.interaction_matrix.shape
+        logger = logging.getLogger(__name__)
 
-        # 공출현 행렬 (items x items)
-        item_co_counts = item_user_matrix @ item_user_matrix.T  # sparse (I x I)
-
-        # 대각 성분 (각 아이템의 자기 공출현: co[i,i])
-        diag = item_co_counts.diagonal().astype(np.float32)
-        diag[diag == 0] = 1e-8
-        inv_sqrt_diag = 1.0 / np.sqrt(diag)
-
-        coo = item_co_counts.tocoo()
-        data = coo.data * inv_sqrt_diag[coo.row] * inv_sqrt_diag[coo.col]
-
-        sim_matrix = sparse.csr_matrix(
-            (data, (coo.row, coo.col)), shape=item_co_counts.shape
+        cache_path = self._get_als_cache_path(
+            factors=factors,
+            regularization=regularization,
+            iterations=iterations,
+            alpha=alpha,
         )
 
-        self.item_similarity = sim_matrix
+        # ----------------------------------------------------
+        # 1) 캐시 있으면 로드 시도
+        # ----------------------------------------------------
+        if (not force_retrain) and os.path.exists(cache_path):
+            try:
+                logger.info("[CF/ALS] 캐시에서 ALS 모델을 로드합니다: %s", cache_path)
+                data = np.load(cache_path)
+                user_factors = data["user_factors"]
+                item_factors = data["item_factors"]
+
+                if user_factors.shape[0] != num_users or item_factors.shape[0] != num_items:
+                    logger.warning(
+                        "[CF/ALS] 캐시의 user/item 크기와 현재 interaction_matrix 크기가 맞지 않습니다. "
+                        "캐시를 무시하고 새로 학습합니다. "
+                        "(cache users=%d, items=%d / current users=%d, items=%d)",
+                        user_factors.shape[0],
+                        item_factors.shape[0],
+                        num_users,
+                        num_items,
+                    )
+                else:
+                    model = AlternatingLeastSquares(
+                        factors=factors,
+                        regularization=regularization,
+                        iterations=iterations,
+                        random_state=42,
+                    )
+                    model.user_factors = user_factors
+                    model.item_factors = item_factors
+
+                    self.als_model = model
+                    logger.info(
+                        "[CF/ALS] ALS 모델 로드 완료 (users=%d, items=%d)",
+                        user_factors.shape[0],
+                        item_factors.shape[0],
+                    )
+                    return
+            except Exception as e:
+                logger.warning(
+                    "[CF/ALS] ALS 캐시 로드 실패(%s). 새로 학습을 수행합니다.", e
+                )
+
+        # ----------------------------------------------------
+        # 2) 새로 학습
+        # ----------------------------------------------------
+        logger.info(
+            "[CF/ALS] ALS 모델을 새로 학습합니다 (factors=%d, reg=%.4f, it=%d, alpha=%.1f)",
+            factors,
+            regularization,
+            iterations,
+            alpha,
+        )
+
+        # ✅ 여기서 더 이상 transpose 하지 말기!
+        user_item_matrix = self.interaction_matrix.tocsr().astype("float32")
+        # user_item_matrix.shape == (num_users, num_items)
+
+        model = AlternatingLeastSquares(
+            factors=factors,
+            regularization=regularization,
+            iterations=iterations,
+            random_state=42,
+        )
+
+        model.fit(user_item_matrix)
 
         logger.info(
-            "[CF] Computed item-item similarity matrix: shape=%s, nnz=%d",
-            sim_matrix.shape,
-            sim_matrix.nnz,
+            "[CF/ALS] 학습 완료: user_factors=%s, item_factors=%s",
+            model.user_factors.shape,
+            model.item_factors.shape,
         )
+
+        # 이제는 반대로 나와야 정상:
+        # user_factors.shape[0] == num_users(44783), item_factors.shape[0] == num_items(812)
+        assert model.user_factors.shape[0] == num_users, "ALS user_factors 크기가 num_users와 다릅니다"
+        assert model.item_factors.shape[0] == num_items, "ALS item_factors 크기가 num_items와 다릅니다"
+
+        self.als_model = model
+
+        # ----------------------------------------------------
+        # 3) 캐시 저장
+        # ----------------------------------------------------
+        try:
+            os.makedirs(self._data_dir, exist_ok=True)
+            np.savez_compressed(
+                cache_path,
+                user_factors=model.user_factors,
+                item_factors=model.item_factors,
+            )
+            logger.info(
+                "[CF/ALS] ALS 학습 결과를 캐시에 저장했습니다: %s", cache_path
+            )
+        except Exception as e:
+            logger.warning("[CF/ALS] ALS 캐시 저장 실패: %s", e)
 
     # --------------------------------------------------------
     # 1-4. 추천 함수
@@ -312,10 +422,10 @@ class CFRecommender:
         filter_read_items: bool = True,
     ) -> List[Dict[str, float]]:
         """
-        특정 user_id에 대해 상위 top_k 추천을 반환.
+        특정 user_id에 대해 ALS 기반 상위 top_k 추천을 반환.
 
-        1순위: item_similarity를 사용한 item-based CF
-        2순위: item_similarity가 없으면 popularity 기반 추천
+        - 기본: implicit ALS 모델(self.als_model)을 사용
+        - als_model이 없으면: popularity 기반으로 fallback
         """
         if self.interaction_matrix is None:
             raise RuntimeError("먼저 load_data()와 build_interaction_matrix()를 호출해야 합니다.")
@@ -323,52 +433,74 @@ class CFRecommender:
         user_idx = self._get_user_index(user_id)
         if user_idx is None:
             logger.warning(
-                "[CF] Unknown user_id=%s (cold-start). 빈 추천을 반환합니다.", user_id
+                "[CF/ALS] Unknown user_id=%s (cold-start). popularity 기반 추천으로 대체합니다.",
+                user_id,
             )
-            return []
+            # cold-start 사용자는 popularity만 쓸 수 있음
+            return self._recommend_by_popularity(top_k=top_k)
 
         user_idx = int(user_idx)
 
         # ----------------------------------------------------
-        # 1) item-based CF (item_similarity가 있을 경우)
+        # 1) ALS 모델이 있으면 ALS 기반 추천
         # ----------------------------------------------------
-        if self.item_similarity is not None:
-            user_row = self.interaction_matrix.getrow(user_idx)  # (1, num_items)
+        if self.als_model is not None:
+            try:
+                user_items = self.interaction_matrix[user_idx]
 
-            # scores: (1, num_items) = user_row * item_similarity
-            scores_matrix = user_row @ self.item_similarity  # (1, num_items)
-            scores = np.asarray(scores_matrix.todense()).ravel()  # (num_items,)
-
-            # 이미 본 아이템 제거 옵션
-            if filter_read_items:
-                seen_idx = self._get_seen_item_indices(user_idx)
-                scores[seen_idx] = -np.inf
-
-            top_indices = np.argsort(scores)[::-1][:top_k]
-
-            results: List[Dict[str, float]] = []
-            for idx in top_indices:
-                if scores[idx] == -np.inf:
-                    continue
-                book_id = int(self.index_to_item[int(idx)])
-                score = float(scores[idx])
-                results.append(
-                    {
-                        "book_id": book_id,
-                        "score": score,
-                        "title": None,
-                        "authors": None,
-                    }
+                item_indices, scores = self.als_model.recommend(
+                    user_idx,
+                    user_items,
+                    N=top_k,
+                    filter_already_liked_items=filter_read_items,
                 )
 
-            return results[:top_k]
+                results: List[Dict[str, float]] = []
+                for idx, score in zip(item_indices, scores):
+                    book_id = int(self.index_to_item[int(idx)])
+                    results.append(
+                        {
+                            "book_id": book_id,
+                            "score": float(score),
+                            "title": None,
+                            "authors": None,
+                        }
+                    )
+
+                return results[:top_k]
+            except Exception as e:
+                logger.exception(
+                    "[CF/ALS] ALS 기반 추천 중 오류 발생 (user_id=%s): %s. popularity로 fallback 합니다.",
+                    user_id,
+                    e,
+                )
 
         # ----------------------------------------------------
-        # 2) (fallback) 단순 popularity 기반 추천
+        # 2) ALS 모델이 없거나 실패한 경우 → popularity fallback
         # ----------------------------------------------------
+        return self._recommend_by_popularity(
+            top_k=top_k,
+            user_idx=user_idx if filter_read_items else None,
+        )
+
+    # --------------------------------------------------------
+    # 1-5. popularity 기반 추천 (fallback용 내부 유틸)
+    # --------------------------------------------------------
+    def _recommend_by_popularity(
+        self,
+        top_k: int = 20,
+        user_idx: Optional[int] = None,
+    ) -> List[Dict[str, float]]:
+        """
+        아이템별 상호작용 수(=popularity)를 기준으로 상위 top_k 아이템을 추천.
+        user_idx가 주어지면, 해당 유저가 이미 본 아이템은 제외한다.
+        """
+        if self.interaction_matrix is None:
+            return []
+
         item_popularity = np.asarray(self.interaction_matrix.sum(axis=0)).ravel()
 
-        if filter_read_items:
+        if user_idx is not None:
             seen_idx = self._get_seen_item_indices(user_idx)
             item_popularity[seen_idx] = -np.inf
 

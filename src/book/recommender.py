@@ -25,12 +25,13 @@ import os
 import json  # ⬅️ 새로 추가
 from typing import Any, Dict, List, Optional, Set
 import logging
-
+import joblib 
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy import sparse
 from src.config import BOOK_TFIDF_MAX_FEATURES
 
 
@@ -254,13 +255,58 @@ class BookRecommender:
 
         # ✅ 반드시 df를 반환해야 self.df가 None이 되지 않습니다.
         return df
+    def _get_tfidf_cache_paths(self) -> tuple[str, str]:
+        """
+        TF-IDF 벡터라이저 / 매트릭스 캐시 파일 경로를 반환.
+        """
+        base_dir = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        cache_dir = os.path.join(base_dir, "data", "goodbooks-10k")
+        os.makedirs(cache_dir, exist_ok=True)
 
+        # BOOK_TFIDF_MAX_FEATURES, full_text 기준이라는 정보 포함
+        tag = f"fulltext_max{BOOK_TFIDF_MAX_FEATURES}"
+        vec_path = os.path.join(cache_dir, f"tfidf_vectorizer_{tag}.joblib")
+        mat_path = os.path.join(cache_dir, f"tfidf_matrix_{tag}.npz")
+        return vec_path, mat_path
 
     def _build_tfidf_matrix(self) -> tuple[TfidfVectorizer, sparse.spmatrix]:
         """
-        full_text 기준 TF-IDF 행렬 생성.
-        - 캐시 없이 매 실행 시 다시 학습 (속도 크게 문제될 정도는 아님)
+        full_text 기준 TF-IDF 행렬 생성 또는 캐시에서 로드.
+
+        - 처음 한 번: fit + transform 후 벡터라이저/행렬을 디스크에 저장
+        - 이후 실행: 캐시에서 로드 (self.df 행 개수와 맞지 않으면 다시 학습)
         """
+        logger = logging.getLogger(__name__)
+        vec_path, mat_path = self._get_tfidf_cache_paths()
+
+        # 1) 캐시 로드 시도
+        if os.path.exists(vec_path) and os.path.exists(mat_path):
+            try:
+                logger.info("[BookRec] TF-IDF 캐시에서 로드 시도: %s, %s", vec_path, mat_path)
+                vectorizer: TfidfVectorizer = joblib.load(vec_path)
+                tfidf_matrix: sparse.spmatrix = sparse.load_npz(mat_path)
+
+                # full_text 길이와 행 수가 맞는지 한번 체크
+                if tfidf_matrix.shape[0] == len(self.df):
+                    logger.info(
+                        "[BookRec] TF-IDF 캐시 로드 완료 (rows=%d, features=%d)",
+                        tfidf_matrix.shape[0],
+                        tfidf_matrix.shape[1],
+                    )
+                    return vectorizer, tfidf_matrix
+                else:
+                    logger.warning(
+                        "[BookRec] TF-IDF 캐시 크기 불일치: matrix_rows=%d, df_rows=%d. 재학습합니다.",
+                        tfidf_matrix.shape[0],
+                        len(self.df),
+                    )
+            except Exception as e:
+                logger.warning("[BookRec] TF-IDF 캐시 로드 실패, 재학습합니다: %s", e)
+
+        # 2) 캐시가 없거나, 크기 불일치/로드 실패 → 새로 학습
+        logger.info("[BookRec] TF-IDF 벡터라이저를 새로 학습합니다.")
         vectorizer = TfidfVectorizer(
             max_features=BOOK_TFIDF_MAX_FEATURES,
             ngram_range=(1, 2),
@@ -268,7 +314,21 @@ class BookRecommender:
         )
         texts = self.df["full_text"].tolist()
         tfidf_matrix = vectorizer.fit_transform(texts)
+
+        # 3) 디스크에 캐시 저장
+        try:
+            joblib.dump(vectorizer, vec_path)
+            sparse.save_npz(mat_path, tfidf_matrix)
+            logger.info(
+                "[BookRec] TF-IDF 학습 결과를 캐시에 저장했습니다: %s, %s",
+                vec_path,
+                mat_path,
+            )
+        except Exception as e:
+            logger.warning("[BookRec] TF-IDF 캐시 저장 실패(실행에는 문제 없음): %s", e)
+
         return vectorizer, tfidf_matrix
+
 
 
     # --------------------------------------------------------

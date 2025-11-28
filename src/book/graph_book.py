@@ -98,15 +98,13 @@ def get_recommenders() -> tuple[BookRecommender, CFRecommender]:
         _content_rec = BookRecommender()
 
     if _cf_rec is None:
-        logger.info("[Graph] Initializing CFRecommender (item-based CF)")
+        logger.info("[Graph] Initializing CFRecommender (ALS-based CF)")
         # content_rec에서 book_id universe를 가져와 CF에 넘겨줌
         valid_book_ids = set(_content_rec.df["book_id"].unique())
         base_dir = os.path.dirname(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         )
-        my_ratings_path = os.path.join(
-            base_dir, "data", "goodbooks-10k", "my_ratings.csv"
-        )
+    
         _cf_rec = CFRecommender(
             min_ratings_per_user=1,
             min_ratings_per_item=1,
@@ -115,8 +113,18 @@ def get_recommenders() -> tuple[BookRecommender, CFRecommender]:
         )
         _cf_rec.load_data()
         _cf_rec.build_interaction_matrix()
-        # item-based similarity 계산 (초기 추천 등에서 사용 가능)
-        _cf_rec.compute_item_similarity()
+
+        # ✅ ALS 학습 또는 캐시 로드
+        try:
+            _cf_rec.fit_als(
+                factors=64,
+                regularization=0.01,
+                iterations=15,
+                alpha=40.0,
+                force_retrain=False,   # True로 주면 캐시 무시하고 재학습
+            )
+        except Exception as e:
+            logger.exception("[Graph] CFRecommender ALS 학습/로드 중 오류: %s", e)
 
     return _content_rec, _cf_rec
 
